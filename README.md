@@ -47,8 +47,8 @@ All configuration is via environment variables — no config files.
 | Variable | Default | Purpose |
 |---|---|---|
 | `OMP_SANDBOX_WORKSPACE` | `$PWD` | Directory OMP can read and write. Defaults to wherever you run the script from. |
-| `OMP_SANDBOX_YOLO` | `0` | Set to `1` to pass `--auto-approve` to omp (no tool-approval prompts). Use only in sandboxed sessions. |
 | `OMP_SANDBOX_EXTRA_WRITE` | _(empty)_ | Colon-separated extra writable paths, e.g. `~/Downloads:~/Desktop`. Leading `~` expands to `$HOME`. |
+| `OMP_SANDBOX_EXTRA_READ` | _(empty)_ | Colon-separated extra readable paths (e.g. an iCloud dir that `~/.omp` symlinks resolve into). Leading `~` expands to `$HOME`. Seatbelt checks the *resolved* real path, so a symlink inside `~/.omp` whose target lives outside it is read-denied unless you list the real target here. |
 
 Examples:
 
@@ -63,6 +63,10 @@ OMP_SANDBOX_WORKSPACE=~/projects/myproject OMP_SANDBOX_YOLO=1 ~/.omp/sandbox/omp
 
 # Allow omp to write screenshots to ~/Downloads in addition to the workspace
 OMP_SANDBOX_EXTRA_WRITE=~/Downloads ~/.omp/sandbox/omp-sandboxed
+
+# Re-allow reads on an iCloud dir that ~/.omp symlinks resolve into.
+# Seatbelt checks the resolved real path, so listing only ~/.omp is insufficient.
+OMP_SANDBOX_EXTRA_READ="$HOME/Library/Mobile Documents/com~apple~CloudDocs/omp-sync" ~/.omp/sandbox/omp-sandboxed
 ```
 
 ## Security model
@@ -86,6 +90,7 @@ Only these `$HOME` paths are readable:
 
 - `~/.omp` — OMP configuration, memories, session state
 - `$OMP_SANDBOX_WORKSPACE` — your project
+- `$OMP_SANDBOX_EXTRA_READ` — opt-in extra readable paths (needed when `~/.omp` symlinks resolve outside it)
 
 All other `$HOME` paths are denied: `~/.ssh`, `~/.aws`, `~/.zsh_history`, `~/.docker`, `~/.kube`, `~/Library/Messages`, `~/Library/Mail`, `~/Library/Keychains`, `~/Library/Mobile Documents` (iCloud), `~/Library/Health`, `~/Library/Passes`, Safari, Contacts, and everything else.
 
@@ -117,6 +122,7 @@ All lines should read `PASS:` and the script exits 0. The self-test checks:
 - `~/.omp` is both readable and writable
 - Workspace reads work (proves the `$HOME` deny + re-allow rule resolves correctly)
 - Keychain, Messages, and iCloud reads are denied
+- `OMP_SANDBOX_EXTRA_READ` paths (if set) are readable
 - `omp --version` boots cleanly under the generated profile
 - `--auto-approve` flag is accepted by the installed omp version
 - `OMP_SANDBOX` and `PI_SANDBOX` env markers are visible inside the sandbox

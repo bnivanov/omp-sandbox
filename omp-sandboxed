@@ -13,6 +13,9 @@
 #
 #   READ (home allowlist — all other $HOME is denied):
 #          ~/.omp  +  $OMP_SANDBOX_WORKSPACE
+#          $OMP_SANDBOX_EXTRA_READ             ← colon-sep opt-in extra read paths
+#                                                  (symlinks under ~/.omp whose targets
+#                                                   resolve outside it must be listed)
 #   READ (system): /usr /System /Library /opt/homebrew /private/var /private/tmp /dev
 #          and all paths outside $HOME (via allow default)
 #   READ scope note: /Volumes and other /Users/* remain readable on this configuration.
@@ -81,6 +84,22 @@ if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
   done
 fi
 
+# Build extra read-allow rules from OMP_SANDBOX_EXTRA_READ (colon-separated).
+# Leading ~ expands to $HOME; each path is SBPL-escaped. Needed for symlinks
+# inside an allowlisted dir (e.g. ~/.omp) whose targets resolve outside it —
+# Seatbelt (subpath ...) matches the kernel-resolved real path, so an iCloud
+# symlink target under ~/.omp is read-denied unless the real path is re-allowed.
+EXTRA_READ_RULES=""
+if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
+  IFS=':' read -ra _extra_read <<< "$OMP_SANDBOX_EXTRA_READ"
+  for p in "${_extra_read[@]}"; do
+    [ -n "$p" ] || continue
+    case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+    EXTRA_READ_RULES="${EXTRA_READ_RULES}    (subpath \"$(sb_escape "$p")\")
+"
+  done
+fi
+
 gen_profile() {
   # Escape all user-controlled paths before interpolating into SBPL.
   local _esc_ws _esc_home _esc_tmp
@@ -111,7 +130,8 @@ ${EXTRA_RULES})
 (deny file-read* (subpath "${_esc_home}"))
 (allow file-read*
     (subpath "${_esc_home}/.omp")
-    (subpath "${_esc_ws}"))
+    (subpath "${_esc_ws}")
+${EXTRA_READ_RULES})
 EOF
 }
 
@@ -217,6 +237,30 @@ if [ "${1:-}" = "--self-test" ]; then
     fi
   fi
 
+  # 5b. EXTRA_READ re-allow works (symlink-target paths resolve and are readable)
+  if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
+    _er_fail=0
+    IFS=':' read -ra _er <<< "$OMP_SANDBOX_EXTRA_READ"
+    for p in "${_er[@]}"; do
+      [ -n "$p" ] || continue
+      case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+      if [ -e "$p" ]; then
+        export _SBX_ER_PROBE="$p"
+        if /usr/bin/sandbox-exec -f "$PROFILE" \
+            /bin/bash -c 'ls "$_SBX_ER_PROBE" >/dev/null' 2>/dev/null; then
+          : # individual pass is silent; we only report aggregate below
+        else
+          _er_fail=1
+        fi
+      fi
+    done
+    if [ "$_er_fail" = 0 ]; then
+      echo "PASS: OMP_SANDBOX_EXTRA_READ paths readable"
+    else
+      echo "FAIL: OMP_SANDBOX_EXTRA_READ paths readable"; _sb_fail=1
+    fi
+  fi
+
   # 6. omp boots and --auto-approve flag accepted (tests actual launch path)
   if _omp_ver="$(/usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" --version 2>/dev/null)" && \
      printf '%s\n' "$_omp_ver" | grep -q '^omp/'; then
@@ -258,4 +302,4 @@ if [ "${OMP_SANDBOX_YOLO:-0}" = 1 ]; then
 fi
 
 cd "$WORKSPACE"
-exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" ${OMP_LAUNCH_ARGS[@]+"${OMP_LAUNCH_ARGS[@]}"} "$@"
