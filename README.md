@@ -18,6 +18,7 @@ Personal data that is read-denied by default: Keychain, Messages, Mail, Calendar
 
 - macOS (any version shipping `/usr/bin/sandbox-exec`)
 - [Oh My Pi](https://omp.dev) installed and on `PATH` (e.g. `brew install omp`)
+Compatible with Apple's stock `/bin/bash` (3.2.57) — array expansions use the `${arr[@]+"${arr[@]}"}` idiom to avoid the bash-3.2 empty-array `unbound variable` crash.
 
 ## Quick start
 

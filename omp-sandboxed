@@ -42,6 +42,8 @@
 #   OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1  allow .ssh/.aws/etc. in EXTRA_READ
 #
 # Requirements: macOS (sandbox-exec present), omp installed (e.g. via Homebrew).
+#   Compatibility: runs under Apple's stock /bin/bash (3.2.57) via the
+#   ${arr[@]+"${arr[@]}"} empty-array idiom (bash 3.x bug fixed in 4.4).
 set -euo pipefail
 
 OMP_BIN="$(command -v omp || true)"
@@ -561,6 +563,28 @@ if [ "${1:-}" = "--self-test" ]; then
     OMP_SANDBOX_EXTRA_READ="" OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$PROFILE"
   fi
 
+# 14. bash-3.2 empty-array safety (${arr[@]+"${arr[@]}"} idiom)
+# On Apple stock /bin/bash (3.2.57), "${arr[@]}" on an empty array under set -u
+# raises "unbound variable" — even when the array was initialized as () (a known
+# bash 3.x bug fixed in 4.4). The exec path expands OMP_LAUNCH_ARGS when YOLO
+# is unset (the default), so every normal launch crashes on bash 3.2.
+# The fix uses "${arr[@]+"${arr[@]}"}" which is a safe no-op on empty arrays
+# across all bash versions (3.2 through 5.x). This test verifies the fix by
+# running the script under /bin/bash (Apple's stock 3.2) with YOLO unset (empty
+# OMP_LAUNCH_ARGS) and --version (reaches the exec path). If the crash
+# persists, "unbound variable" appears in stderr.
+_SBX_B32_DIR="$(/usr/bin/mktemp -d -t omp-sandbox-b32-$$)"
+# Capture output separately (not in a pipeline) so pipefail in the parent
+# doesn't mask grep's result — the subprocess crashes with exit!=0 either way.
+_SBX_B32_OUT="$(OMP_SANDBOX_WORKSPACE="$_SBX_B32_DIR" /bin/bash "$0" --version 2>&1 || true)"
+if printf '%s\n' "$_SBX_B32_OUT" | /usr/bin/grep -q 'unbound variable'; then
+  echo "FAIL: bash-3.2 empty-array crash persists under /bin/bash (OMP_LAUNCH_ARGS[@]: unbound variable)"
+  _sb_fail=1
+else
+  echo "PASS: bash-3.2 empty-array crash is fixed (\${arr[@]+...} idiom)"
+fi
+rm -rf "$_SBX_B32_DIR"
+
   exit "$_sb_fail"
 fi
 
@@ -587,8 +611,8 @@ fi
 cd "$WORKSPACE"
 if [ "${OMP_SANDBOX_INHERIT_ENV:-0}" = "1" ]; then
   echo "omp-sandboxed: warning: OMP_SANDBOX_INHERIT_ENV=1 — full parent env passed to sandbox (insecure)" >&2
-  exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+  exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]+"${OMP_LAUNCH_ARGS[@]}"}" "$@"
 else
   exec /usr/bin/env -i "${_clean_env[@]}" \
-    /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+    /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]+"${OMP_LAUNCH_ARGS[@]}"}" "$@"
 fi
