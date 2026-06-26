@@ -23,7 +23,7 @@ Personal data that is read-denied by default: Keychain, Messages, Mail, Calendar
 
 ```bash
 # 1. Clone
-git clone https://github.com/Adornoo/omp-sandbox ~/.omp/sandbox
+git clone https://github.com/bnivanov/omp-sandbox ~/.omp/sandbox
 
 # 2. Make executable
 chmod +x ~/.omp/sandbox/omp-sandboxed
@@ -48,7 +48,12 @@ All configuration is via environment variables — no config files.
 |---|---|---|
 | `OMP_SANDBOX_WORKSPACE` | `$PWD` | Directory OMP can read and write. Defaults to wherever you run the script from. |
 | `OMP_SANDBOX_YOLO` | `0` | Set to `1` to pass `--auto-approve` to omp (no tool-approval prompts). Use only in sandboxed sessions. |
-| `OMP_SANDBOX_EXTRA_WRITE` | _(empty)_ | Colon-separated extra writable paths, e.g. `~/Downloads:~/Desktop`. Leading `~` expands to `$HOME`. |
+| `OMP_SANDBOX_EXTRA_WRITE` | _(empty)_ | Colon-separated extra writable paths. Leading `~` expands to `$HOME`. Each path is canonicalized and checked against a denylist (`.ssh`, `.aws`, Keychains, etc.). |
+| `OMP_SANDBOX_PASS_ENV` | _(empty)_ | **Colon-separated env var names to forward into the clean sandbox env. Required for provider API keys** — e.g. `OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY`. Without this, OMP cannot reach its model API. |
+| `OMP_SANDBOX_INHERIT_ENV` | `0` | Set to `1` to pass the full parent environment instead of the minimal allowlist. Insecure — exposes all shell secrets to the sandboxed process and any host it reaches. |
+| `OMP_SANDBOX_CONFIRM_WIDE` | `0` | Set to `1` to allow `$HOME` or `/` as workspace (otherwise rejected). Insecure. |
+| `OMP_SANDBOX_SKIP_HOME_VERIFY` | `0` | Set to `1` to skip the `dscl` home-directory verification. Insecure — allows HOME-poisoning attacks. |
+| `OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE` | `0` | Set to `1` to allow sensitive paths (`.ssh`, `.aws`, Keychains, etc.) in `OMP_SANDBOX_EXTRA_WRITE`. Insecure. |
 
 Examples:
 
@@ -63,6 +68,16 @@ OMP_SANDBOX_WORKSPACE=~/projects/myproject OMP_SANDBOX_YOLO=1 ~/.omp/sandbox/omp
 
 # Allow omp to write screenshots to ~/Downloads in addition to the workspace
 OMP_SANDBOX_EXTRA_WRITE=~/Downloads ~/.omp/sandbox/omp-sandboxed
+
+# Pass provider API key into the minimal clean environment (required by default)
+OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY OMP_SANDBOX_WORKSPACE=~/projects/myproject \
+  ~/.omp/sandbox/omp-sandboxed
+
+# Multiple keys, colon-separated
+OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY:OPENAI_API_KEY ~/.omp/sandbox/omp-sandboxed
+
+# Legacy: pass full parent environment — exposes all shell secrets (insecure)
+OMP_SANDBOX_INHERIT_ENV=1 ~/.omp/sandbox/omp-sandboxed
 ```
 
 ## Security model
@@ -91,6 +106,26 @@ All other `$HOME` paths are denied: `~/.ssh`, `~/.aws`, `~/.zsh_history`, `~/.do
 
 System paths outside `$HOME` remain readable — OMP's runtimes require them.
 
+### Environment isolation
+
+By default the launcher uses `env -i` to give the sandboxed process only a minimal allowlist (PATH, HOME, TMPDIR, locale, terminal variables). All other shell variables — AWS credentials, GitHub tokens, and any other secrets in your shell — are **stripped automatically**.
+
+OMP needs its model provider key to operate. Pass it explicitly:
+
+```bash
+OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY ~/.omp/sandbox/omp-sandboxed
+```
+
+To revert to the old full-env behaviour (not recommended):
+
+```bash
+OMP_SANDBOX_INHERIT_ENV=1 ~/.omp/sandbox/omp-sandboxed
+```
+
+### HOME verification
+
+The launcher resolves the real user home via `/usr/bin/dscl` and **rejects launch** if the inherited `$HOME` differs — this is the exact vector for read-confinement bypass (a malicious wrapper could set `HOME=/tmp` before launch). Set `OMP_SANDBOX_SKIP_HOME_VERIFY=1` to override.
+
 ### Known remaining surface
 
 - **`/Volumes`** — mounted external/network drives are readable. Add `(deny file-read* (subpath "/Volumes"))` inside `gen_profile` if needed.
@@ -117,9 +152,12 @@ All lines should read `PASS:` and the script exits 0. The self-test checks:
 - `~/.omp` is both readable and writable
 - Workspace reads work (proves the `$HOME` deny + re-allow rule resolves correctly)
 - Keychain, Messages, and iCloud reads are denied
-- `omp --version` boots cleanly under the generated profile
+- `omp --version` boots cleanly under the minimal clean environment (same as real launches)
 - `--auto-approve` flag is accepted by the installed omp version
-- `OMP_SANDBOX` and `PI_SANDBOX` env markers are visible inside the sandbox
+- `OMP_SANDBOX` and `PI_SANDBOX` env markers are present inside the clean env
+- `TMPDIR` canonicalizes to a valid macOS scratch root, not an attacker-controlled path
+- A secret canary is absent from the `env -i` sandbox — env isolation is verified end-to-end
+- `.ssh` is detected as a sensitive `EXTRA_WRITE` target and rejected by the denylist
 
 ## Printing the active profile
 

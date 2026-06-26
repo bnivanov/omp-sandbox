@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # omp-sandboxed — run Oh My Pi (omp) inside a macOS Seatbelt sandbox.
-# https://github.com/Adornoo/omp-sandbox
+# https://github.com/bnivanov/omp-sandbox
 #
 # Write/read boundary:
 #   WRITE: $OMP_SANDBOX_WORKSPACE (default: $PWD)
@@ -28,6 +28,15 @@
 #   omp-sandboxed --self-test                           verify boundaries, exit 0/1
 #   omp-sandboxed --print-profile                       print the Seatbelt profile
 #
+# Environment (security — all default to the safe setting):
+#   OMP_SANDBOX_PASS_ENV=VAR:VAR2   colon-sep vars forwarded into the clean env.
+#                                   Required for provider API keys, e.g.:
+#                                   OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY
+#   OMP_SANDBOX_INHERIT_ENV=1       pass the full parent env instead (insecure)
+#   OMP_SANDBOX_SKIP_HOME_VERIFY=1  skip dscl HOME verification (insecure)
+#   OMP_SANDBOX_CONFIRM_WIDE=1      allow $HOME or / as workspace (insecure)
+#   OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1  allow .ssh/.aws/etc. in EXTRA_WRITE
+#
 # Requirements: macOS (sandbox-exec present), omp installed (e.g. via Homebrew).
 set -euo pipefail
 
@@ -39,7 +48,41 @@ if [ ! -x /usr/bin/sandbox-exec ]; then
   echo "omp-sandboxed: error: /usr/bin/sandbox-exec not found (requires macOS)" >&2; exit 1
 fi
 
-HOME_DIR="$HOME"
+# Resolve home from the OS directory service rather than the inherited $HOME
+# to prevent environment-poisoning attacks on the read-deny policy (Finding-2).
+# All binaries are absolute-pathed; "NFSHomeDirectory: " is stripped verbatim so
+# home paths containing spaces are handled correctly (no awk field-splitting).
+# Fails closed: exits on dscl failure or HOME mismatch unless
+# OMP_SANDBOX_SKIP_HOME_VERIFY=1 is explicitly set.
+_dscl_raw="$(/usr/bin/dscl . -read "/Users/$(/usr/bin/id -un)" NFSHomeDirectory 2>/dev/null)" || true
+HOME_DIR=""
+case "$_dscl_raw" in
+  "NFSHomeDirectory: "*)
+    _dscl_candidate="${_dscl_raw#NFSHomeDirectory: }"
+    if [ -d "$_dscl_candidate" ]; then
+      HOME_DIR="$(cd "$_dscl_candidate" && pwd -P)"
+    else
+      echo "omp-sandboxed: error: dscl reported home '$_dscl_candidate' does not exist" >&2; exit 1
+    fi ;;
+esac
+if [ -z "$HOME_DIR" ]; then
+  if [ "${OMP_SANDBOX_SKIP_HOME_VERIFY:-0}" = "1" ]; then
+    echo "omp-sandboxed: warning: dscl home lookup failed; using inherited HOME (OMP_SANDBOX_SKIP_HOME_VERIFY=1)" >&2
+    HOME_DIR="$(cd "${HOME:?HOME is unset}" && pwd -P)"
+  else
+    echo "omp-sandboxed: error: could not verify user home via /usr/bin/dscl. Set OMP_SANDBOX_SKIP_HOME_VERIFY=1 to use inherited HOME (insecure)." >&2; exit 1
+  fi
+fi
+# Reject launch if the inherited HOME differs from the real home — a mismatch is the
+# exact attack vector the dscl lookup is meant to prevent (Finding-2).
+if [ "${HOME:-}" != "$HOME_DIR" ]; then
+  if [ "${OMP_SANDBOX_SKIP_HOME_VERIFY:-0}" = "1" ]; then
+    echo "omp-sandboxed: warning: inherited HOME ('${HOME:-}') differs from real home '$HOME_DIR'; using real home (OMP_SANDBOX_SKIP_HOME_VERIFY=1)" >&2
+  else
+    echo "omp-sandboxed: error: inherited HOME ('${HOME:-}') differs from real user home '$HOME_DIR'. Refusing to launch to prevent profile bypass. Set OMP_SANDBOX_SKIP_HOME_VERIFY=1 to override (insecure)." >&2; exit 1
+  fi
+fi
+export HOME="$HOME_DIR"
 
 # Canonicalize workspace: resolve symlinks and relative paths so Seatbelt's
 # (subpath ...) rules match the kernel-visible path.
@@ -52,10 +95,25 @@ fi
 WORKSPACE="$(cd "$_workspace_raw" && pwd -P)"
 
 if [ "$WORKSPACE" = "/" ] || [ "$WORKSPACE" = "$HOME_DIR" ]; then
-  echo "omp-sandboxed: warning: workspace is '$WORKSPACE' — this grants very broad write access" >&2
+  if [ "${OMP_SANDBOX_CONFIRM_WIDE:-0}" != "1" ]; then
+    echo "omp-sandboxed: error: workspace '$WORKSPACE' grants very broad access — refusing to launch. Set OMP_SANDBOX_CONFIRM_WIDE=1 to override." >&2
+    exit 1
+  fi
+  echo "omp-sandboxed: warning: workspace '$WORKSPACE' — very broad access confirmed by OMP_SANDBOX_CONFIRM_WIDE=1" >&2
 fi
 
-TMPDIR_CANON="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+# Canonicalize TMPDIR and validate it is a known macOS scratch root (Finding-1).
+# An attacker-controlled TMPDIR pointing to $HOME would widen the write allowlist.
+# Re-export TMPDIR to the validated value so the sandboxed process inherits a safe path.
+_tmpdir_raw="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P || echo '/private/tmp')"
+case "$_tmpdir_raw" in
+  /private/tmp|/private/tmp/*|/private/var/folders/*)
+    TMPDIR_CANON="$_tmpdir_raw" ;;
+  *)
+    echo "omp-sandboxed: warning: TMPDIR ('$_tmpdir_raw') is not a known macOS scratch root — using /private/tmp for policy" >&2
+    TMPDIR_CANON="/private/tmp" ;;
+esac
+export TMPDIR="$TMPDIR_CANON"
 
 # sb_escape PATH — escape backslashes and double-quotes for SBPL string literals.
 # Rejects paths containing newlines (APFS does not permit them in filenames).
@@ -65,17 +123,99 @@ sb_escape() {
     exit 1
     ;;
   esac
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  local _s="${1//\\/\\\\}"          # backslash → double-backslash
+  printf '%s' "${_s//\"/\\\"}"      # double-quote → backslash double-quote
+}
+
+# _sbx_sensitive_path PATH — returns 0 if PATH covers a sensitive home location (Finding-5).
+# Catches: _p is an ancestor of a sensitive dir, _p equals one, or _p is under one.
+_sbx_sensitive_path() {
+  local _p="$1" _s
+  for _s in \
+      "$HOME_DIR/.ssh"          "$HOME_DIR/.aws"              "$HOME_DIR/.gnupg" \
+      "$HOME_DIR/.netrc"        "$HOME_DIR/.netrc.gpg"        \
+      "$HOME_DIR/Library/Keychains"                            \
+      "$HOME_DIR/Library/LaunchAgents"                         \
+      "$HOME_DIR/Library/Application Support/Google"           \
+      "$HOME_DIR/Library/Safari"                               \
+      "$HOME_DIR/.bashrc"       "$HOME_DIR/.bash_profile"     \
+      "$HOME_DIR/.zshrc"        "$HOME_DIR/.zprofile"          \
+      "$HOME_DIR/.profile"
+  do
+    case "$_s/" in "$_p"*) return 0 ;; esac   # _p is ancestor of or equals _s
+    case "$_p/" in "$_s"*) return 0 ;; esac   # _p is at/under _s
+  done
+  return 1
+}
+
+# _sbx_canon_extra_path PATH — canonicalize an EXTRA_WRITE candidate path.
+# Rejects relative paths and explicit .. segments; resolves symlinks via cd+pwd -P
+# so _sbx_sensitive_path sees the real target, not an indirection alias.
+_sbx_canon_extra_path() {
+  local _raw="$1" _canon _dir _base
+  case "$_raw" in
+    /*) : ;;
+    *) echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' must be absolute" >&2; exit 1 ;;
+  esac
+  case "$_raw" in
+    */../*|*/..|../*|..)
+      echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' contains '..' — rejected to prevent traversal bypass" >&2; exit 1 ;;
+  esac
+  if _canon="$(cd "$_raw" 2>/dev/null && pwd -P)"; then
+    printf '%s' "$_canon"
+  else
+    _dir="${_raw%/*}"; _base="${_raw##*/}"
+    [ -z "$_dir" ] && _dir="/"
+    if _canon="$(cd "$_dir" 2>/dev/null && pwd -P)"; then
+      printf '%s/%s' "$_canon" "$_base"
+    else
+      echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' cannot be canonicalized (parent does not exist)" >&2; exit 1
+    fi
+  fi
+}
+
+# _sbx_build_clean_env — populate _clean_env with the minimal env -i allowlist (Finding-3).
+# Called by both --self-test (adversarial canary) and the final exec so both paths
+# exercise identical policy. Pass provider keys with OMP_SANDBOX_PASS_ENV=VAR1:VAR2.
+_sbx_build_clean_env() {
+  local _sv _passval _passenv
+  _clean_env=("HOME=$HOME_DIR" "TMPDIR=$TMPDIR_CANON" \
+              "OMP_SANDBOX=seatbelt" "PI_SANDBOX=seatbelt")
+  for _sv in PATH USER LOGNAME SHELL LANG LC_ALL LC_CTYPE LC_MESSAGES \
+             TERM TERM_PROGRAM COLORTERM __CF_USER_TEXT_ENCODING COMMAND_MODE; do
+    [ -n "${!_sv:-}" ] && _clean_env+=("$_sv=${!_sv}")
+  done
+  if [ -n "${OMP_SANDBOX_PASS_ENV:-}" ]; then
+    IFS=':' read -ra _passenv <<< "$OMP_SANDBOX_PASS_ENV"
+    for _sv in "${_passenv[@]}"; do
+      [ -n "$_sv" ] || continue
+      _passval="${!_sv:-}"
+      if [ -n "$_passval" ]; then
+        _clean_env+=("$_sv=$_passval")
+      else
+        echo "omp-sandboxed: warning: OMP_SANDBOX_PASS_ENV: '$_sv' is not set or empty" >&2
+      fi
+    done
+  fi
 }
 
 # Build extra write-allow rules from OMP_SANDBOX_EXTRA_WRITE (colon-separated).
-# Leading ~ expands to $HOME; each path is SBPL-escaped.
+# Each path: expand ~, canonicalize (resolves symlinks and .. so the denylist sees
+# the real target), check sensitive denylist, then SBPL-escape (Finding-5).
 EXTRA_RULES=""
 if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
   IFS=':' read -ra _extra <<< "$OMP_SANDBOX_EXTRA_WRITE"
   for p in "${_extra[@]}"; do
     [ -n "$p" ] || continue
     case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+    p="$(_sbx_canon_extra_path "$p")"
+    if _sbx_sensitive_path "$p"; then
+      if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE:-0}" != "1" ]; then
+        echo "omp-sandboxed: error: EXTRA_WRITE path '$p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1 to override" >&2
+        exit 1
+      fi
+      echo "omp-sandboxed: warning: EXTRA_WRITE '$p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1)" >&2
+    fi
     EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$p")\")
 "
   done
@@ -119,7 +259,7 @@ export OMP_SANDBOX=seatbelt
 export PI_SANDBOX=seatbelt
 
 if [ "${1:-}" = "--self-test" ]; then
-  PROFILE="$(mktemp -t omp-sandbox)"
+  PROFILE="$(/usr/bin/mktemp -t omp-sandbox)"
   trap 'rm -f "$PROFILE"' EXIT
   gen_profile > "$PROFILE"
   _sb_fail=0
@@ -129,6 +269,10 @@ if [ "${1:-}" = "--self-test" ]; then
   export _SBX_WS="$WORKSPACE"
   export _SBX_WS_PROBE="$WORKSPACE/.sbx_probe"
   export _SBX_OMP_PROBE="$HOME_DIR/.omp/.sbx_probe"
+
+  # Build clean env once here; tests 6, 7, and 9 all use env -i "${_clean_env[@]}"
+  # so they exercise the same policy as the real exec path.
+  _sbx_build_clean_env
 
   # 1. workspace write allowed
   if /usr/bin/sandbox-exec -f "$PROFILE" \
@@ -217,27 +361,56 @@ if [ "${1:-}" = "--self-test" ]; then
     fi
   fi
 
-  # 6. omp boots and --auto-approve flag accepted (tests actual launch path)
-  if _omp_ver="$(/usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" --version 2>/dev/null)" && \
+  # 6. omp boots under the clean env (matches real launch path — not inherited env)
+  if _omp_ver="$(env -i "${_clean_env[@]}" \
+      /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" --version 2>/dev/null)" && \
      printf '%s\n' "$_omp_ver" | grep -q '^omp/'; then
-    echo "PASS: omp boots under sandbox"
+    echo "PASS: omp boots under sandbox (clean env)"
   else
-    echo "FAIL: omp boots under sandbox"; _sb_fail=1
+    echo "FAIL: omp boots under sandbox (clean env)"; _sb_fail=1
   fi
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
+  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
       "$OMP_BIN" --auto-approve --version 2>/dev/null | grep -q '^[0-9]'; then
-    echo "PASS: --auto-approve flag accepted by omp"
+    echo "PASS: --auto-approve flag accepted by omp (clean env)"
   else
-    echo "FAIL: --auto-approve flag accepted by omp"; _sb_fail=1
+    echo "FAIL: --auto-approve flag accepted by omp (clean env)"; _sb_fail=1
   fi
 
   # 7. sandbox env markers visible inside the sandbox
-  _env_out="$(/usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
+  _env_out="$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
   if printf '%s\n' "$_env_out" | grep -qx 'OMP_SANDBOX=seatbelt' && \
      printf '%s\n' "$_env_out" | grep -qx 'PI_SANDBOX=seatbelt'; then
     echo "PASS: sandbox env marker set"
   else
     echo "FAIL: sandbox env marker set"; _sb_fail=1
+  fi
+
+  # 8. TMPDIR_CANON is a known macOS scratch root (adversarial: TMPDIR poisoning)
+  case "$TMPDIR_CANON" in
+    /private/tmp|/private/tmp/*|/private/var/folders/*)
+      echo "PASS: TMPDIR scratch root is valid ($TMPDIR_CANON)" ;;
+    *)
+      echo "FAIL: TMPDIR ($TMPDIR_CANON) is not a known macOS scratch root"; _sb_fail=1 ;;
+  esac
+
+  # 9. Adversarial env-isolation via shared _sbx_build_clean_env (Finding-3)
+  # Canary is set after _sbx_build_clean_env so it is guaranteed absent from _clean_env;
+  # env -i must then exclude it — same code path as the real exec.
+  export _SBX_SECRET_CANARY="sbx-canary-$$"
+  _env_isolated_out="$(env -i "${_clean_env[@]}" \
+      /usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
+  if printf '%s\n' "$_env_isolated_out" | grep -q '_SBX_SECRET_CANARY'; then
+    echo "FAIL: secret canary visible inside clean env-i sandbox"; _sb_fail=1
+  else
+    echo "PASS: secret canary absent from clean env-i sandbox"
+  fi
+  unset _SBX_SECRET_CANARY
+
+  # 10. Sensitive EXTRA_WRITE path detection (adversarial: EXTRA_WRITE denylist)
+  if _sbx_sensitive_path "$HOME_DIR/.ssh"; then
+    echo "PASS: .ssh detected as sensitive EXTRA_WRITE target"
+  else
+    echo "FAIL: .ssh not detected as sensitive EXTRA_WRITE target"; _sb_fail=1
   fi
 
   exit "$_sb_fail"
@@ -247,7 +420,7 @@ if [ "${1:-}" = "--print-profile" ]; then
   gen_profile; exit 0
 fi
 
-PROFILE="$(mktemp -t omp-sandbox)"
+PROFILE="$(/usr/bin/mktemp -t omp-sandbox)"
 trap 'rm -f "$PROFILE"' EXIT
 gen_profile > "$PROFILE"
 
@@ -257,5 +430,17 @@ if [ "${OMP_SANDBOX_YOLO:-0}" = 1 ]; then
   OMP_LAUNCH_ARGS+=(--auto-approve)
 fi
 
+# Assemble clean environment via the shared helper (Finding-3).
+# OMP_SANDBOX_INHERIT_ENV=1 skips this and passes the full parent env (insecure).
+if [ "${OMP_SANDBOX_INHERIT_ENV:-0}" != "1" ]; then
+  _sbx_build_clean_env
+fi
+
 cd "$WORKSPACE"
-exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+if [ "${OMP_SANDBOX_INHERIT_ENV:-0}" = "1" ]; then
+  echo "omp-sandboxed: warning: OMP_SANDBOX_INHERIT_ENV=1 — full parent env passed to sandbox (insecure)" >&2
+  exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+else
+  exec /usr/bin/env -i "${_clean_env[@]}" \
+    /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
+fi
