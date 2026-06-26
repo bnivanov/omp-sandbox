@@ -12,7 +12,9 @@
 #   WRITE DENIED: everything else
 #
 #   READ (home allowlist — all other $HOME is denied):
-#          ~/.omp  +  $OMP_SANDBOX_WORKSPACE
+#          ~/.omp  +  $OMP_SANDBOX_WORKSPACE  +  $OMP_SANDBOX_EXTRA_READ
+#          (EXTRA_READ mirrors EXTRA_WRITE: same canonicalization + sensitive-path
+#           denylist; sensitive reads must be approved via OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)
 #   READ (system): /usr /System /Library /opt/homebrew /private/var /private/tmp /dev
 #          and all paths outside $HOME (via allow default)
 #   READ scope note: /Volumes and other /Users/* remain readable on this configuration.
@@ -36,6 +38,8 @@
 #   OMP_SANDBOX_SKIP_HOME_VERIFY=1  skip dscl HOME verification (insecure)
 #   OMP_SANDBOX_CONFIRM_WIDE=1      allow $HOME or / as workspace (insecure)
 #   OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1  allow .ssh/.aws/etc. in EXTRA_WRITE
+#   OMP_SANDBOX_EXTRA_READ             colon-sep opt-in extra read paths under $HOME
+#   OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1  allow .ssh/.aws/etc. in EXTRA_READ
 #
 # Requirements: macOS (sandbox-exec present), omp installed (e.g. via Homebrew).
 set -euo pipefail
@@ -148,18 +152,19 @@ _sbx_sensitive_path() {
   return 1
 }
 
-# _sbx_canon_extra_path PATH — canonicalize an EXTRA_WRITE candidate path.
+# _sbx_canon_extra_path LABEL PATH — canonicalize an EXTRA_{WRITE,READ} candidate.
 # Rejects relative paths and explicit .. segments; resolves symlinks via cd+pwd -P
-# so _sbx_sensitive_path sees the real target, not an indirection alias.
+# so _sbx_sensitive_path sees the real target, not an indirection alias. LABEL is
+# the originating env ("EXTRA_WRITE" / "EXTRA_READ") used in error messages.
 _sbx_canon_extra_path() {
-  local _raw="$1" _canon _dir _base
+  local _label="$1" _raw="$2" _canon _dir _base
   case "$_raw" in
     /*) : ;;
-    *) echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' must be absolute" >&2; exit 1 ;;
+    *) echo "omp-sandboxed: error: ${_label} path '$_raw' must be absolute" >&2; exit 1 ;;
   esac
   case "$_raw" in
     */../*|*/..|../*|..)
-      echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' contains '..' — rejected to prevent traversal bypass" >&2; exit 1 ;;
+      echo "omp-sandboxed: error: ${_label} path '$_raw' contains '..' — rejected to prevent traversal bypass" >&2; exit 1 ;;
   esac
   if _canon="$(cd "$_raw" 2>/dev/null && pwd -P)"; then
     printf '%s' "$_canon"
@@ -169,7 +174,7 @@ _sbx_canon_extra_path() {
     if _canon="$(cd "$_dir" 2>/dev/null && pwd -P)"; then
       printf '%s/%s' "$_canon" "$_base"
     else
-      echo "omp-sandboxed: error: EXTRA_WRITE path '$_raw' cannot be canonicalized (parent does not exist)" >&2; exit 1
+      echo "omp-sandboxed: error: ${_label} path '$_raw' cannot be canonicalized (parent does not exist)" >&2; exit 1
     fi
   fi
 }
@@ -208,7 +213,7 @@ if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
   for p in "${_extra[@]}"; do
     [ -n "$p" ] || continue
     case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
-    p="$(_sbx_canon_extra_path "$p")"
+    p="$(_sbx_canon_extra_path EXTRA_WRITE "$p")"
     if _sbx_sensitive_path "$p"; then
       if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE:-0}" != "1" ]; then
         echo "omp-sandboxed: error: EXTRA_WRITE path '$p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1 to override" >&2
@@ -217,6 +222,30 @@ if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
       echo "omp-sandboxed: warning: EXTRA_WRITE '$p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1)" >&2
     fi
     EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$p")\")
+"
+  done
+fi
+
+# Build extra read-allow rules from OMP_SANDBOX_EXTRA_READ (colon-separated).
+# Mirrors EXTRA_WRITE: expand ~, canonicalize via the same LABEL-aware helper,
+# check the SAME sensitive-path denylist (reading ~/.ssh/.aws/Keychains is as
+# dangerous as writing them), confirm-gate via OMP_SANDBOX_CONFIRM_SENSITIVE_READ.
+# Distinct array (_extra_r) and accumulator (EXTRA_READ_RULES) so both can be set.
+EXTRA_READ_RULES=""
+if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
+  IFS=':' read -ra _extra_r <<< "$OMP_SANDBOX_EXTRA_READ"
+  for p in "${_extra_r[@]}"; do
+    [ -n "$p" ] || continue
+    case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+    p="$(_sbx_canon_extra_path EXTRA_READ "$p")"
+    if _sbx_sensitive_path "$p"; then
+      if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_READ:-0}" != "1" ]; then
+        echo "omp-sandboxed: error: EXTRA_READ path '$p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 to override" >&2
+        exit 1
+      fi
+      echo "omp-sandboxed: warning: EXTRA_READ '$p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)" >&2
+    fi
+    EXTRA_READ_RULES="${EXTRA_READ_RULES}    (subpath \"$(sb_escape "$p")\")
 "
   done
 fi
@@ -251,7 +280,23 @@ ${EXTRA_RULES})
 (deny file-read* (subpath "${_esc_home}"))
 (allow file-read*
     (subpath "${_esc_home}/.omp")
-    (subpath "${_esc_ws}"))
+    (subpath "${_esc_ws}")
+${EXTRA_READ_RULES})
+;; --- home-node metadata: Go programs (filepath.EvalSymlinks / os.MkdirAll)
+;; stat() the \$HOME node itself during path canonicalization. The (subpath ...)
+;; re-allow rules above cover only DESCENDANTS of allowlisted subtrees, never the
+;; \$HOME node, so any allowlisted \$HOME subdir breaks Go path canonicalization
+;; (symptom: Go programs report "mkdir /Users/<user>: file exists" or SQLite
+;; CANTOPEN (14) even when the leaf file lives in an allowlisted dir). C binaries
+;; that just open() the leaf rely on kernel traversal and never stat the \$HOME
+;; node, so they do not expose the gap.
+;; Allow STAT of the \$HOME node ONLY — every descendant outside the allowlists
+;; above stays denied, so isolation is not weakened. file-read-metadata is the
+;; narrowest read class (stat/lstat/fstat/getattrlist); it does NOT include
+;; file-read-data (readdir, which would disclose top-level names of \$HOME) or
+;; file-write*. The disclosed metadata (mode/owner/timestamps of the \$HOME dir
+;; inode) is already world-readable via `ls -ld $HOME` outside any sandbox.
+(allow file-read-metadata (literal "${_esc_home}"))
 EOF
 }
 
@@ -260,7 +305,8 @@ export PI_SANDBOX=seatbelt
 
 if [ "${1:-}" = "--self-test" ]; then
   PROFILE="$(/usr/bin/mktemp -t omp-sandbox)"
-  trap 'rm -f "$PROFILE"' EXIT
+  _err="$(/usr/bin/mktemp -t omp-sandbox-err)"
+  trap 'rm -f "$PROFILE" "$_err"' EXIT
   gen_profile > "$PROFILE"
   _sb_fail=0
 
@@ -411,6 +457,108 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "PASS: .ssh detected as sensitive EXTRA_WRITE target"
   else
     echo "FAIL: .ssh not detected as sensitive EXTRA_WRITE target"; _sb_fail=1
+  fi
+
+  # 11. Home-node metadata stat allowed (Go path-canonicalization regression)
+  # Go programs (filepath.EvalSymlinks / os.MkdirAll) stat() the $HOME node itself
+  # when canonicalizing a path under an allowlisted $HOME subtree. The (subpath ...)
+  # read re-allows cover only DESCENDANTS, not the $HOME node, so without the
+  # explicit (allow file-read-metadata (literal $HOME)) rule the stat walk fails
+  # and Go binaries error out with "mkdir /Users/<user>: file exists" or SQLite
+  # CANTOPEN (14) even on allowlisted paths. C binaries that just open() the leaf
+  # never expose the gap, so this test must stat() $HOME itself.
+  # Uses the clean env (matches the real exec path). HOME is in _clean_env.
+  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c '/usr/bin/stat -f "%Su" "$HOME" >/dev/null' 2>/dev/null; then
+    echo "PASS: \$HOME node metadata stat allowed"
+  else
+    echo "FAIL: \$HOME node metadata stat allowed (Go path-canonicalization regressed)"; _sb_fail=1
+  fi
+
+  # 12. Home-node readdir stays DENIED (narrowness guard on the rule above)
+  # Companion to test 11: stat() of $HOME passes under BOTH file-read-metadata
+  # (the narrow rule this PR adds) AND a wider file-read* rule, so test 11 alone
+  # cannot catch an accidental widening that would also grant readdir of $HOME
+  # and disclose its top-level entry names (~/.ssh, ~/.aws, etc. by name).
+  # opendir/readdir uses file-read-data on the directory node — a class NOT
+  # covered by file-read-metadata. So `ls "$HOME"` MUST still fail; this
+  # assertion flips (LEAK_BAD) iff someone broadens the carve-out to
+  # (allow file-read* (literal "$HOME")), making the narrowness self-enforcing.
+  # Clean env (matches the real exec path); HOME is in _clean_env.
+  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'ls "$HOME" >/dev/null' 2>/dev/null; then
+    echo "FAIL: \$HOME node readdir still denied (carve-out was widened — top-level names now disclosed)"; _sb_fail=1
+  else
+    echo "PASS: \$HOME node readdir still denied"
+  fi
+
+  # 13. EXTRA_READ build-block fires + sensitive-path gate denies ~/.ssh without confirm
+  # OMP_SANDBOX_EXTRA_READ is the read-side mirror of EXTRA_WRITE (same canon helper,
+  # same sensitive-path denylist, its own OMP_SANDBOX_CONFIRM_SENSITIVE_READ gate).
+  # This test exercises the build block end-to-end via --print-profile (the same
+  # code the real exec runs to build EXTRA_READ_RULES). Two assertions:
+  #   (a) EXTRA_READ=~/.ssh with confirm unset -> profile-gen MUST abort with the
+  #       sensitive-deny error (an attacker could otherwise read SSH keys by
+  #       listing them in EXTRA_READ; reading secrets is as bad as writing them).
+  #   (b) EXTRA_READ=~/.ssh with CONFIRM_SENSITIVE_READ=1 -> profile-gen succeeds
+  #       and the profile MUST contain ~/.ssh as a subpath of the read-allow block.
+  if OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.ssh" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
+       "$0" --print-profile >/dev/null 2>"$_err"; then
+    echo "FAIL: EXTRA_READ sensitive-path gate did not fire (~/.ssh accepted without CONFIRM_SENSITIVE_READ=1)"; _sb_fail=1
+  elif ! grep -q 'sensitive home location' "$_err"; then
+    echo "FAIL: EXTRA_READ=~/.ssh rejected, but not via the sensitive-path gate:" >&2
+    cat "$_err" >&2; _sb_fail=1
+  else
+    echo "PASS: EXTRA_READ sensitive-path gate rejects ~/.ssh without CONFIRM_SENSITIVE_READ=1"
+  fi
+  if OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.ssh" OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 \
+       OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile 2>/dev/null \
+       | grep -q "subpath \"$HOME_DIR/.ssh\")"; then
+    echo "PASS: EXTRA_READ ~/.ssh allowed with CONFIRM_SENSITIVE_READ=1 (appears in read allowlist)"
+  else
+    echo "FAIL: EXTRA_READ ~/.ssh + CONFIRM_SENSITIVE_READ=1 did not produce the expected subpath rule" >&2
+    _sb_fail=1
+  fi
+
+  # 13c. EXTRA_READ path is actually READABLE in the sandbox (the whole point).
+  # The two assertions above only check the sensitive-path GATE at profile-gen
+  # time. This one exercises the feature end-to-end inside a real sandbox:
+  # place a canary file under a $HOME subdir that NO baseline allowlist covers
+  # (~/.omp and $WORKSPACE only), then assert:
+  #   (i)  baseline (no EXTRA_READ): cat is DENIED by the $HOME read-deny rule
+  #   (ii) with EXTRA_READ=that subdir: cat SUCCEEDS, proving the EXTRA_READ
+  #        (subpath ...) rule opened the path through the $HOME deny.
+  # Placing the canary inside $HOME is what makes this test meaningful — outside
+  # $HOME everything is already readable via (allow default), so an outside-$HOME
+  # canary would pass the same way with or without EXTRA_READ and prove nothing.
+  # Mirrors self-tests #3/#4 (which probe reads via sandbox-exec -f "$PROFILE"
+  # /bin/bash -c 'cat ...' directly, not through omp).
+  _extread_root="$HOME_DIR/.sbx_extread_$$"
+  rm -rf "$_extread_root" 2>/dev/null || true
+  mkdir -p "$_extread_root/sub" && echo "extread-canary" > "$_extread_root/sub/file"
+  trap 'rm -f "$PROFILE" "$_err"; rm -rf "$_extread_root" 2>/dev/null || true' EXIT
+  # (i) baseline: EXTRA_READ unset, cat must FAIL
+  if env -i "${_clean_env[@]}" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
+       /usr/bin/sandbox-exec -f "$PROFILE" /bin/bash -c \
+       "cat '$_extread_root/sub/file' >/dev/null 2>&1" 2>/dev/null; then
+    echo "FAIL: EXTRA_READ canary was readable WITHOUT EXTRA_READ (\$HOME deny did not fire — EXTRA_READ has no work to do)"; _sb_fail=1
+    rm -rf "$_extread_root"
+  else
+    # (ii) with EXTRA_READ: cat must SUCCEED. Regenerate the profile with EXTRA_READ
+    # set so EXTRA_READ_RULES picks up the canary dir; then sandbox-exec the cat.
+    OMP_SANDBOX_EXTRA_READ="$_extread_root/sub" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
+      "$0" --print-profile > "$PROFILE"
+    if env -i "${_clean_env[@]}" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
+         /usr/bin/sandbox-exec -f "$PROFILE" /bin/bash -c \
+         "cat '$_extread_root/sub/file' >/dev/null" 2>/dev/null; then
+      echo "PASS: EXTRA_READ path is readable inside the sandbox (EXTRA_READ rule opened the \$HOME-denied path)"
+    else
+      echo "FAIL: EXTRA_READ path was NOT readable inside the sandbox — feature does not work end-to-end" >&2
+      _sb_fail=1
+    fi
+    rm -rf "$_extread_root"
+    # Restore the original PROFILE so later tests aren't perturbed by the EXTRA_READ one.
+    OMP_SANDBOX_EXTRA_READ="" OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$PROFILE"
   fi
 
   exit "$_sb_fail"
