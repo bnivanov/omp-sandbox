@@ -72,6 +72,10 @@ OMP_SANDBOX_WORKSPACE=~/projects/myproject OMP_SANDBOX_YOLO=1 ~/.omp/sandbox/omp
 # Allow omp to write screenshots to ~/Downloads in addition to the workspace
 OMP_SANDBOX_EXTRA_WRITE=~/Downloads ~/.omp/sandbox/omp-sandboxed
 
+# Allow omp's mnemon memory store: recall + remember (read+write)
+# ~/.mnemon must be passed to BOTH EXTRA_WRITE (for remember) and EXTRA_READ.
+OMP_SANDBOX_EXTRA_WRITE=~/.mnemon OMP_SANDBOX_EXTRA_READ=~/.mnemon ~/.omp/sandbox/omp-sandboxed
+
 # Pass provider API key into the minimal clean environment (required by default)
 OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY OMP_SANDBOX_WORKSPACE=~/projects/myproject \
   ~/.omp/sandbox/omp-sandboxed
@@ -97,6 +101,7 @@ Only these locations are writable inside the sandbox:
 | `/private/var/folders` | Bun/Python bytecode caches |
 | `/dev` | Device nodes (`/dev/null`, `/dev/urandom`, pipes) |
 | `$OMP_SANDBOX_EXTRA_WRITE` | Opt-in extra paths |
+| `~/.mnemon` (via `EXTRA_WRITE`+`EXTRA_READ`) | OMP's persistent memory store (mnemon). **Opt-in**: set `OMP_SANDBOX_EXTRA_WRITE=~/.mnemon` and `OMP_SANDBOX_EXTRA_READ=~/.mnemon` to enable recall+remember under the sandbox. |
 
 ### Read allowlist (within `$HOME`)
 
@@ -105,6 +110,7 @@ Only these `$HOME` paths are readable:
 - `~/.omp` — OMP configuration, memories, session state
 - `$OMP_SANDBOX_WORKSPACE` — your project
 - `$OMP_SANDBOX_EXTRA_READ` — opt-in extra `$HOME`-subtree paths; canonicalized and sensitive-path-checked the same way as `EXTRA_WRITE` (so `EXTRA_READ=~/.ssh` requires `OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1`). Use it when a tool needs to read a `$HOME` path that is neither `~/.omp` nor the workspace (e.g. a notes dir, a model cache).
+- `~/.mnemon` (via `EXTRA_READ`+`EXTRA_WRITE`) — OMP's persistent memory store (mnemon). **Opt-in**: pass `~/.mnemon` in both `OMP_SANDBOX_EXTRA_READ` and `OMP_SANDBOX_EXTRA_WRITE` to enable `mnemon recall`/`mnemon remember` inside the sandbox. No `MNEMON_DATA_DIR` env forward is needed: with the store at its default `~/.mnemon` (a real directory, not a symlink), mnemon resolves the path itself; its only `$HOME` ancestor is `$HOME`, already covered by the home-node metadata rule.
 
 All other `$HOME` paths are denied: `~/.ssh`, `~/.aws`, `~/.zsh_history`, `~/.docker`, `~/.kube`, `~/Library/Messages`, `~/Library/Mail`, `~/Library/Keychains`, `~/Library/Mobile Documents` (iCloud), `~/Library/Health`, `~/Library/Passes`, Safari, Contacts, and everything else.
 
@@ -183,6 +189,7 @@ All lines should read `PASS:` and the script exits 0. The self-test checks:
 - `readdir` of the `$HOME` node itself stays DENIED — companion to the above; proves the carve-out is metadata-only (passes under `file-read-metadata`, fails under a widened `file-read*`), so a future change that broadens the rule and starts disclosing top-level `$HOME` entry names flips this assertion
 - `OMP_SANDBOX_EXTRA_READ`'s sensitive-path gate fires end-to-end — `EXTRA_READ=~/.ssh` aborts profile generation with the sensitive-deny error unless `OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1` is set, in which case `~/.ssh` appears in the read allowlist as a `(subpath ...)` rule. Mirrors the `.ssh`-as-`EXTRA_WRITE` test; proves the new read-side opt-in path is gated the same way as `EXTRA_WRITE` (reading secrets is as bad as writing them)
 - an `OMP_SANDBOX_EXTRA_READ` path is actually **readable inside the sandbox** — with `EXTRA_READ` unset, `cat` of a canary file under a `$HOME` subdir that no baseline allowlist covers is denied by the `$HOME` read-deny rule; with `EXTRA_READ=that subdir`, `cat` succeeds (the `(subpath ...)` rule opened the `$HOME`-denied path). Placing the canary inside `$HOME` is what makes this meaningful — outside `$HOME` everything is already readable via `(allow default)`, so an outside-`$HOME` canary would pass either way and prove nothing. Mirrors self-tests #3/#4 (direct `sandbox-exec -f "$PROFILE" /bin/bash -c 'cat ...'`, not through omp).
+- the omp memory store is **reachable inside the sandbox** — when `mnemon` is installed and `~/.mnemon` exists, `mnemon recall` opens the database under a profile generated with `~/.mnemon` passed via `OMP_SANDBOX_EXTRA_WRITE`+`EXTRA_READ` (proving the `EXTRA_*` mechanism and the `$HOME`-node stat rule compose to cover the mnemon case the same way any user opt-in does). The self-test folds `~/.mnemon` into `EXTRA_*` automatically; in production you set them yourself. Skipped if `mnemon` is absent or the store dir does not exist.
 
 ## Printing the active profile
 
