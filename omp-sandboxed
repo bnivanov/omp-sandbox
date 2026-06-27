@@ -9,10 +9,12 @@
 #          /private/var/folders                ← Bun/Python caches (required)
 #          /dev                                ← device nodes (required)
 #          $OMP_SANDBOX_EXTRA_WRITE            ← colon-sep opt-in extra paths
+#          (mnemon: pass ~/.mnemon via EXTRA_WRITE+EXTRA_READ; see README)
 #   WRITE DENIED: everything else
 #
 #   READ (home allowlist — all other $HOME is denied):
 #          ~/.omp  +  $OMP_SANDBOX_WORKSPACE  +  $OMP_SANDBOX_EXTRA_READ
+#          (mnemon: pass ~/.mnemon via EXTRA_READ+EXTRA_WRITE; see README)
 #          (EXTRA_READ mirrors EXTRA_WRITE: same canonicalization + sensitive-path
 #           denylist; sensitive reads must be approved via OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)
 #   READ (system): /usr /System /Library /opt/homebrew /private/var /private/tmp /dev
@@ -206,51 +208,56 @@ _sbx_build_clean_env() {
   fi
 }
 
-# Build extra write-allow rules from OMP_SANDBOX_EXTRA_WRITE (colon-separated).
-# Each path: expand ~, canonicalize (resolves symlinks and .. so the denylist sees
-# the real target), check sensitive denylist, then SBPL-escape (Finding-5).
-EXTRA_RULES=""
-if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
-  IFS=':' read -ra _extra <<< "$OMP_SANDBOX_EXTRA_WRITE"
-  for p in "${_extra[@]}"; do
-    [ -n "$p" ] || continue
-    case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
-    p="$(_sbx_canon_extra_path EXTRA_WRITE "$p")"
-    if _sbx_sensitive_path "$p"; then
-      if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE:-0}" != "1" ]; then
-        echo "omp-sandboxed: error: EXTRA_WRITE path '$p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1 to override" >&2
-        exit 1
+# Build extra write+read allow rules from OMP_SANDBOX_EXTRA_WRITE / EXTRA_READ.
+# Colon-separated; each path is ~-expanded, canonicalized (resolves symlinks and
+# .. so the sensitive denylist sees the real target), sensitive-gated, and
+# SBPL-escaped. Idempotent: resets EXTRA_RULES/EXTRA_READ_RULES each call so it
+# can be re-run after the self-test folds ~/.mnemon into EXTRA_* (top-level runs
+# once at script entry; the self-test re-runs it to pick up the folded paths).
+# Reading secrets is as dangerous as writing them — EXTRA_READ applies the SAME
+# sensitive-path denylist as EXTRA_WRITE, with its own CONFIRM_SENSITIVE_READ gate.
+_sbx_build_extra_rules() {
+  EXTRA_RULES=""
+  if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
+    local _p
+    IFS=':' read -ra _sbx_exw <<< "$OMP_SANDBOX_EXTRA_WRITE"
+    for _p in "${_sbx_exw[@]}"; do
+      [ -n "$_p" ] || continue
+      case "$_p" in "~"*) _p="${HOME_DIR}${_p#\~}";; esac
+      _p="$(_sbx_canon_extra_path EXTRA_WRITE "$_p")"
+      if _sbx_sensitive_path "$_p"; then
+        if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE:-0}" != "1" ]; then
+          echo "omp-sandboxed: error: EXTRA_WRITE path '$_p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1 to override" >&2
+          exit 1
+        fi
+        echo "omp-sandboxed: warning: EXTRA_WRITE '$_p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1)" >&2
       fi
-      echo "omp-sandboxed: warning: EXTRA_WRITE '$p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1)" >&2
-    fi
-    EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$p")\")
+      EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$_p")\")
 "
-  done
-fi
+    done
+  fi
+  EXTRA_READ_RULES=""
+  if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
+    local _p
+    IFS=':' read -ra _sbx_exr <<< "$OMP_SANDBOX_EXTRA_READ"
+    for _p in "${_sbx_exr[@]}"; do
+      [ -n "$_p" ] || continue
+      case "$_p" in "~"*) _p="${HOME_DIR}${_p#\~}";; esac
+      _p="$(_sbx_canon_extra_path EXTRA_READ "$_p")"
+      if _sbx_sensitive_path "$_p"; then
+        if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_READ:-0}" != "1" ]; then
+          echo "omp-sandboxed: error: EXTRA_READ path '$_p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 to override" >&2
+          exit 1
+        fi
+        echo "omp-sandboxed: warning: EXTRA_READ '$_p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)" >&2
+      fi
+      EXTRA_READ_RULES="${EXTRA_READ_RULES}    (subpath \"$(sb_escape "$_p")\")
+"
+    done
+  fi
+}
+_sbx_build_extra_rules
 
-# Build extra read-allow rules from OMP_SANDBOX_EXTRA_READ (colon-separated).
-# Mirrors EXTRA_WRITE: expand ~, canonicalize via the same LABEL-aware helper,
-# check the SAME sensitive-path denylist (reading ~/.ssh/.aws/Keychains is as
-# dangerous as writing them), confirm-gate via OMP_SANDBOX_CONFIRM_SENSITIVE_READ.
-# Distinct array (_extra_r) and accumulator (EXTRA_READ_RULES) so both can be set.
-EXTRA_READ_RULES=""
-if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
-  IFS=':' read -ra _extra_r <<< "$OMP_SANDBOX_EXTRA_READ"
-  for p in "${_extra_r[@]}"; do
-    [ -n "$p" ] || continue
-    case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
-    p="$(_sbx_canon_extra_path EXTRA_READ "$p")"
-    if _sbx_sensitive_path "$p"; then
-      if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_READ:-0}" != "1" ]; then
-        echo "omp-sandboxed: error: EXTRA_READ path '$p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 to override" >&2
-        exit 1
-      fi
-      echo "omp-sandboxed: warning: EXTRA_READ '$p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)" >&2
-    fi
-    EXTRA_READ_RULES="${EXTRA_READ_RULES}    (subpath \"$(sb_escape "$p")\")
-"
-  done
-fi
 
 gen_profile() {
   # Escape all user-controlled paths before interpolating into SBPL.
@@ -311,6 +318,11 @@ if [ "${1:-}" = "--self-test" ]; then
   trap 'rm -f "$PROFILE" "$_err"' EXIT
   gen_profile > "$PROFILE"
   _sb_fail=0
+  # Capture the user's original EXTRA_* so test 13 can restore $PROFILE to the
+  # entry state after clobbering it with the canary dir. (No mnemon fold here —
+  # test 15 generates its own self-contained profile below.)
+  _entry_xw="${OMP_SANDBOX_EXTRA_WRITE:-}"
+  _entry_xr="${OMP_SANDBOX_EXTRA_READ:-}"
 
   # Export probe paths as env vars so every bash -c string below can use
   # single quotes — no user-controlled values are interpolated into shell strings.
@@ -318,11 +330,10 @@ if [ "${1:-}" = "--self-test" ]; then
   export _SBX_WS_PROBE="$WORKSPACE/.sbx_probe"
   export _SBX_OMP_PROBE="$HOME_DIR/.omp/.sbx_probe"
 
-  # Build clean env once here; tests 6, 7, and 9 all use env -i "${_clean_env[@]}"
+  # Build clean env once here; tests 6, 7, 9, and 15 all use env -i "${_clean_env[@]}"
   # so they exercise the same policy as the real exec path.
   _sbx_build_clean_env
 
-  # 1. workspace write allowed
   if /usr/bin/sandbox-exec -f "$PROFILE" \
       /bin/bash -c 'echo ok > "$_SBX_WS_PROBE" && rm "$_SBX_WS_PROBE"' 2>/dev/null; then
     echo "PASS: workspace write allowed"
@@ -559,17 +570,16 @@ if [ "${1:-}" = "--self-test" ]; then
       _sb_fail=1
     fi
     rm -rf "$_extread_root"
-    # Restore the original PROFILE so later tests aren't perturbed by the EXTRA_READ one.
-    OMP_SANDBOX_EXTRA_READ="" OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$PROFILE"
+    # Restore $PROFILE to the entry state (the user's original EXTRA_*) so later
+    # tests aren't perturbed by the canary-dir profile above.
+    OMP_SANDBOX_EXTRA_WRITE="${_entry_xw:-}" OMP_SANDBOX_EXTRA_READ="${_entry_xr:-}" \
+      OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$PROFILE"
   fi
 
 # 14. bash-3.2 empty-array safety (${arr[@]+"${arr[@]}"} idiom)
 # On Apple stock /bin/bash (3.2.57), "${arr[@]}" on an empty array under set -u
 # raises "unbound variable" — even when the array was initialized as () (a known
 # bash 3.x bug fixed in 4.4). The exec path expands OMP_LAUNCH_ARGS when YOLO
-# is unset (the default), so every normal launch crashes on bash 3.2.
-# The fix uses "${arr[@]+"${arr[@]}"}" which is a safe no-op on empty arrays
-# across all bash versions (3.2 through 5.x). This test verifies the fix by
 # running the script under /bin/bash (Apple's stock 3.2) with YOLO unset (empty
 # OMP_LAUNCH_ARGS) and --version (reaches the exec path). If the crash
 # persists, "unbound variable" appears in stderr.
@@ -584,6 +594,32 @@ else
   echo "PASS: bash-3.2 empty-array crash is fixed (\${arr[@]+...} idiom)"
 fi
 rm -rf "$_SBX_B32_DIR"
+
+  # 15. mnemon store reachable under a profile that allowlists ~/.mnemon via the
+  # EXTRA_* mechanism (the same mechanism users use in production). SELF-
+  # CONTAINED: this test generates its OWN profile (with EXTRA_*=~/.mnemon) rather
+  # than reusing $PROFILE, so it cannot be silently fed or broken by test 13's
+  # clobber-then-restore of $PROFILE. Asserts recall RETURNED a result (grep
+  # '"id"'), not just exit 0 — `mnemon recall` can exit 0 with empty output on
+  # some failure modes, which would otherwise be a false pass.
+  if [ -d "$HOME_DIR/.mnemon" ] && command -v mnemon >/dev/null 2>&1; then
+    _t15_prof="$(/usr/bin/mktemp -t omp-sandbox-t15)"
+    OMP_SANDBOX_EXTRA_WRITE="$HOME_DIR/.mnemon" \
+    OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.mnemon" \
+    OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$_t15_prof"
+    _t15_out=$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$_t15_prof" \
+        mnemon recall __omp_sandbox_selftest__ --limit 1 2>&1) || _t15_out=""
+    rm -f "$_t15_prof"
+    if printf '%s\n' "$_t15_out" | grep -q '"id"'; then
+      echo "PASS: mnemon store reachable under sandbox (recall returned a result)"
+    else
+      echo "FAIL: mnemon store NOT reachable under sandbox (recall returned no result)" >&2
+      printf '%s\n' "$_t15_out" | head -5 >&2
+      _sb_fail=1
+    fi
+  else
+    echo "SKIP: mnemon store reachability (mnemon not installed or store dir absent)"
+  fi
 
   exit "$_sb_fail"
 fi
